@@ -11,6 +11,7 @@ mod bug_report;
 mod commands;
 mod config;
 mod export;
+mod extensions;
 mod images;
 mod logging;
 mod lsp;
