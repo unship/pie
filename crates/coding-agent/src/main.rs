@@ -25,6 +25,7 @@ mod oauth;
 mod otlp;
 mod session;
 mod skills;
+mod spinner;
 mod templates;
 mod tools;
 mod tui;
@@ -455,6 +456,18 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         // @file expansion) so recall surfaces what the user actually typed.
         history.append(input);
 
+        // Active-prompt spinner. Starts before the prompt future, gets cancelled on the
+        // FIRST agent event via `stop_sync()` — the cancel path also emits the line clear
+        // immediately, so streamed assistant output begins on a clean stderr line.
+        let spin = spinner::start("thinking");
+        let spin_for_listener = spin.clone();
+        let _unsub_spin = harness.agent().subscribe(std::sync::Arc::new(move |_, _| {
+            let s = spin_for_listener.clone();
+            Box::pin(async move {
+                s.stop_sync();
+            })
+        }));
+
         // First-time image attachment goes through harness.prompt_with_images directly; the
         // session_runner retry/rewind path doesn't need to participate for a one-shot
         // describe-this-image flow.
@@ -487,6 +500,10 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
                 }
             }
         };
+
+        // Idempotent: if the listener already fired, this is a no-op. If the prompt
+        // errored or aborted before any agent event, this clears the spinner here.
+        spin.stop_sync();
 
         if aborted.load(std::sync::atomic::Ordering::SeqCst) {
             tui.system_line("[aborted]");
