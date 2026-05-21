@@ -3,9 +3,9 @@ name = "pie-ai"
 version = "0.75.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Rust port of @earendil-works/pie-ai — unified streaming LLM client across Anthropic / OpenAI / Google / Bedrock / Mistral and OpenAI-compatible endpoints."
+description = "Rust rewrite of the original pi AI client — unified streaming LLM client across Anthropic / OpenAI / Google / Bedrock / Mistral and OpenAI-compatible endpoints."
 license = "MIT"
-repository = "https://github.com/earendil-works/pi"
+repository = "https://github.com/earendil-works/pie"
 authors = ["earendil-works"]
 
 [lib]

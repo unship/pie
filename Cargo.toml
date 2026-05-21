@@ -21,8 +21,8 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 authors = ["earendil-works"]
-repository = "https://github.com/earendil-works/pi"
-homepage = "https://github.com/earendil-works/pi"
+repository = "https://github.com/earendil-works/pie"
+homepage = "https://github.com/earendil-works/pie"
 
 # Shared dependency versions. Crates opt in with `dep.workspace = true`; we keep the existing
 # per-crate Cargo.toml entries untouched on purpose (they still work) so the merge is

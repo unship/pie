@@ -3,9 +3,9 @@ name = "pie-agent-core"
 version = "0.75.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Rust port of @earendil-works/pie-agent-core — stateful agent runtime + harness (Agent loop, skills, prompt templates, sessions, compaction) on top of pie-ai."
+description = "Rust rewrite of the original pi agent core — stateful agent runtime + harness (Agent loop, skills, prompt templates, sessions, compaction) on top of pie-ai."
 license = "MIT"
-repository = "https://github.com/earendil-works/pi"
+repository = "https://github.com/earendil-works/pie"
 authors = ["earendil-works"]
 
 [lib]

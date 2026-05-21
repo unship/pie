@@ -115,6 +115,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+## Credits
+
+`pie` is a Rust rewrite of the original [`pi`](https://github.com/earendil-works/pi) project by earendil-works.
+
 ## License
 
 [MIT](LICENSE)
