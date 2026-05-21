@@ -61,7 +61,7 @@ fn faux_model() -> pie_ai::Model {
         thinking_level_map: None,
         input: vec![],
         cost: ModelCost::default(),
-        context_window: 0,
+        context_window: 1,
         max_tokens: 0,
         headers: None,
         compat: None,
@@ -218,4 +218,125 @@ X-Pie-Test = "webhook-e2e"
     assert_eq!(payload["source"], "user");
     assert_eq!(payload["message_kind"], "assistant");
     assert_eq!(payload["message_summary"], "webhook ack");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_webhook_receives_manual_force_compact_from_harness_bus() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let pie_dir = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let _pie_dir_guard = EnvGuard::set("PIE_DIR", pie_dir.path());
+    let (webhook_url, request) = capture_one_request().await;
+
+    let hooks_toml = format!(
+        r#"
+[[hook]]
+event = "compaction"
+webhook = "{webhook_url}"
+timeout_ms = 3000
+"#
+    );
+    std::fs::write(pie_dir.path().join("hooks.toml"), hooks_toml).unwrap();
+
+    let model = faux_model();
+    let loaded = hooks::load(
+        cwd.path(),
+        "session-manual-compaction-e2e",
+        Some(&model),
+        Some(ThinkingLevel::Off),
+    )
+    .await;
+    assert_eq!(loaded.diagnostics, Vec::<String>::new());
+    assert_eq!(loaded.runner.len(), 1);
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(model, session);
+    opts.stream_fn = Some(faux_stream("manual summary"));
+    let harness = AgentHarness::new(opts);
+    let _unsub_hooks = harness.subscribe_harness(loaded.runner.harness_listener());
+
+    harness.prompt("first turn").await.unwrap();
+    harness.prompt("second turn").await.unwrap();
+    assert!(harness.force_compact(None).await.unwrap());
+
+    let raw_request = tokio::time::timeout(Duration::from_secs(3), request)
+        .await
+        .expect("manual compaction webhook request timed out")
+        .expect("webhook server task failed");
+    let (_, body) = raw_request
+        .split_once("\r\n\r\n")
+        .expect("request must contain a body separator");
+    let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(payload["event"], "compaction");
+    assert_eq!(payload["session_id"], "session-manual-compaction-e2e");
+    assert_eq!(payload["source"], "user");
+    assert_eq!(payload["compaction_trigger"], "manual");
+    assert_eq!(payload["compaction_summary"], "manual summary");
+    assert!(
+        payload["compaction_tokens_before"].as_u64().unwrap_or(0) > 0,
+        "payload: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_webhook_receives_auto_compaction_from_harness_bus() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let pie_dir = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let _pie_dir_guard = EnvGuard::set("PIE_DIR", pie_dir.path());
+    let (webhook_url, request) = capture_one_request().await;
+
+    let hooks_toml = format!(
+        r#"
+[[hook]]
+event = "compaction"
+webhook = "{webhook_url}"
+timeout_ms = 3000
+"#
+    );
+    std::fs::write(pie_dir.path().join("hooks.toml"), hooks_toml).unwrap();
+
+    let model = faux_model();
+    let loaded = hooks::load(
+        cwd.path(),
+        "session-auto-compaction-e2e",
+        Some(&model),
+        Some(ThinkingLevel::Off),
+    )
+    .await;
+    assert_eq!(loaded.diagnostics, Vec::<String>::new());
+    assert_eq!(loaded.runner.len(), 1);
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(model, session);
+    opts.stream_fn = Some(faux_stream("auto summary"));
+    let harness = AgentHarness::new(opts);
+    let _unsub_hooks = harness.subscribe_harness(loaded.runner.harness_listener());
+
+    harness.prompt("first turn").await.unwrap();
+    harness.prompt("second turn").await.unwrap();
+    harness
+        .prompt("third turn triggers auto compaction first")
+        .await
+        .unwrap();
+
+    let raw_request = tokio::time::timeout(Duration::from_secs(3), request)
+        .await
+        .expect("auto compaction webhook request timed out")
+        .expect("webhook server task failed");
+    let (_, body) = raw_request
+        .split_once("\r\n\r\n")
+        .expect("request must contain a body separator");
+    let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(payload["event"], "compaction");
+    assert_eq!(payload["session_id"], "session-auto-compaction-e2e");
+    assert_eq!(payload["source"], "user");
+    assert_eq!(payload["compaction_trigger"], "auto");
+    assert_eq!(payload["compaction_summary"], "auto summary");
+    assert!(
+        payload["compaction_tokens_before"].as_u64().unwrap_or(0) > 0,
+        "payload: {payload}"
+    );
 }

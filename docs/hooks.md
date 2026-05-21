@@ -71,6 +71,15 @@ event = "agent_end"
 command = "osascript -e 'display notification \"pie finished\" with title \"pie\"'"
 ```
 
+Send a webhook when context compaction runs:
+
+```toml
+[[hook]]
+event = "compaction"
+webhook = "https://example.com/pie/compaction"
+timeout_ms = 5000
+```
+
 ## Hook Fields
 
 Each `[[hook]]` supports:
@@ -103,10 +112,16 @@ message_end
 tool_start
 tool_update
 tool_end
+compaction
 ```
 
 `message_update` can fire frequently while a model streams. Use it only when you actually need
 streaming-level callbacks.
+
+`compaction` fires after successful automatic context compaction and after manual `/compact`.
+Its payload includes `compaction_trigger = "auto" | "manual"`, the estimated summarized token
+count, and a truncated summary. Compaction summaries can contain sensitive context; only send
+them to destinations you trust.
 
 ## Command Environment
 
@@ -125,9 +140,12 @@ PIE_ASSISTANT_EVENT
 PIE_TOOL_CALL_ID
 PIE_TOOL_NAME
 PIE_TOOL_IS_ERROR
+PIE_COMPACTION_TRIGGER
+PIE_COMPACTION_TOKENS_BEFORE
 ```
 
 `PIE_HOOK_PAYLOAD` points to a temporary JSON file containing the same payload sent to webhooks.
+Compaction summaries are available in this JSON payload, not as an environment variable.
 
 ## Webhook Payload
 
@@ -150,3 +168,22 @@ Webhook hooks receive `Content-Type: application/json` with fields such as:
 ```
 
 Long message and tool summaries are truncated before being placed in the payload.
+
+A compaction webhook payload looks like:
+
+```json
+{
+  "event": "compaction",
+  "session_id": "...",
+  "cwd": "/path/to/repo",
+  "model_provider": "openai",
+  "model_id": "gpt-5.5",
+  "thinking_level": "off",
+  "source": "user",
+  "compaction_trigger": "auto",
+  "compaction_tokens_before": 12345,
+  "compaction_summary": "..."
+}
+```
+
+Long compaction summaries are truncated before being placed in the payload.

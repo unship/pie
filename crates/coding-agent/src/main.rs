@@ -333,6 +333,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // Wire the TUI listener so each prompt's events stream live.
     let _unsub = harness.agent().subscribe(tui.listener());
     let _unsub_hooks = harness.agent().subscribe(hooks.runner.listener());
+    let _unsub_harness_hooks = harness.subscribe_harness(hooks.runner.harness_listener());
 
     let registry = commands::Registry::with_builtins();
 

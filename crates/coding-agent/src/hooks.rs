@@ -11,7 +11,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pie_agent_core::{AgentEvent, AgentListener, AgentMessage, ThinkingLevel};
+use pie_agent_core::{
+    AgentEvent, AgentListener, AgentMessage, HarnessEvent, HarnessListener, ThinkingLevel,
+};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -63,6 +65,7 @@ enum HookEvent {
     ToolStart,
     ToolUpdate,
     ToolEnd,
+    Compaction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -126,6 +129,9 @@ pub struct HookPayload {
     tool_is_error: Option<bool>,
     tool_args: Option<serde_json::Value>,
     tool_result_summary: Option<String>,
+    compaction_trigger: Option<String>,
+    compaction_tokens_before: Option<u64>,
+    compaction_summary: Option<String>,
 }
 
 struct EventData {
@@ -138,6 +144,9 @@ struct EventData {
     tool_is_error: Option<bool>,
     tool_args: Option<serde_json::Value>,
     tool_result_summary: Option<String>,
+    compaction_trigger: Option<String>,
+    compaction_tokens_before: Option<u64>,
+    compaction_summary: Option<String>,
 }
 
 pub async fn load(
@@ -292,10 +301,32 @@ impl HookRunner {
         })
     }
 
+    pub fn harness_listener(self: &Arc<Self>) -> HarnessListener {
+        let me = self.clone();
+        Arc::new(move |event| {
+            let me = me.clone();
+            tokio::spawn(async move {
+                me.handle_harness_event(&event, CancellationToken::new())
+                    .await;
+            });
+        })
+    }
+
     pub async fn handle_event(&self, event: &AgentEvent, cancel: CancellationToken) {
         let Some(data) = EventData::from_agent_event(event) else {
             return;
         };
+        self.handle_data(data, cancel).await;
+    }
+
+    pub async fn handle_harness_event(&self, event: &HarnessEvent, cancel: CancellationToken) {
+        let Some(data) = EventData::from_harness_event(event) else {
+            return;
+        };
+        self.handle_data(data, cancel).await;
+    }
+
+    async fn handle_data(&self, data: EventData, cancel: CancellationToken) {
         let matching = self
             .rules
             .iter()
@@ -335,6 +366,9 @@ impl HookRunner {
             tool_is_error: data.tool_is_error,
             tool_args: data.tool_args.clone(),
             tool_result_summary: data.tool_result_summary.clone(),
+            compaction_trigger: data.compaction_trigger.clone(),
+            compaction_tokens_before: data.compaction_tokens_before,
+            compaction_summary: data.compaction_summary.clone(),
         }
     }
 
@@ -482,6 +516,7 @@ impl HookEvent {
             "tool_start" => Some(Self::ToolStart),
             "tool_update" => Some(Self::ToolUpdate),
             "tool_end" => Some(Self::ToolEnd),
+            "compaction" => Some(Self::Compaction),
             _ => None,
         }
     }
@@ -498,6 +533,7 @@ impl HookEvent {
             Self::ToolStart => "tool_start",
             Self::ToolUpdate => "tool_update",
             Self::ToolEnd => "tool_end",
+            Self::Compaction => "compaction",
         }
     }
 }
@@ -587,8 +623,34 @@ impl EventData {
             tool_is_error: None,
             tool_args: None,
             tool_result_summary: None,
+            compaction_trigger: None,
+            compaction_tokens_before: None,
+            compaction_summary: None,
         }
     }
+
+    fn from_harness_event(event: &HarnessEvent) -> Option<Self> {
+        match event {
+            HarnessEvent::Compaction {
+                from_hook,
+                summary,
+                tokens_before,
+            } => {
+                let mut d = Self::basic(HookEvent::Compaction);
+                d.compaction_trigger = Some(compaction_trigger(*from_hook).into());
+                d.compaction_tokens_before = Some(*tokens_before);
+                d.compaction_summary = Some(truncate(summary));
+                Some(d)
+            }
+            HarnessEvent::SessionStart { .. } | HarnessEvent::Branch { .. } => None,
+        }
+    }
+}
+
+fn compaction_trigger(from_hook: bool) -> &'static str {
+    // In current AgentHarness call sites, true is the explicit `force_compact` path used by
+    // `/compact`; false is the threshold-based automatic compaction path.
+    if from_hook { "manual" } else { "auto" }
 }
 
 fn env_for(payload: &HookPayload, payload_path: &Path) -> BTreeMap<String, String> {
@@ -617,6 +679,12 @@ fn env_for(payload: &HookPayload, payload_path: &Path) -> BTreeMap<String, Strin
     }
     if let Some(v) = payload.tool_is_error {
         env.insert("PIE_TOOL_IS_ERROR".into(), v.to_string());
+    }
+    if let Some(v) = &payload.compaction_trigger {
+        env.insert("PIE_COMPACTION_TRIGGER".into(), v.clone());
+    }
+    if let Some(v) = payload.compaction_tokens_before {
+        env.insert("PIE_COMPACTION_TOKENS_BEFORE".into(), v.to_string());
     }
     env
 }
@@ -781,6 +849,10 @@ command = "echo ok"
 tool = "bash"
 
 [[hook]]
+event = "compaction"
+command = "echo compacted"
+
+[[hook]]
 event = "not_real"
 command = "echo nope"
             "#,
@@ -789,9 +861,10 @@ command = "echo nope"
         let mut rules = Vec::new();
         let mut diagnostics = Vec::new();
         push_rules(file, "test", &mut rules, &mut diagnostics);
-        assert_eq!(rules.len(), 1);
+        assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].event, HookEvent::ToolEnd);
         assert_eq!(rules[0].tool.as_deref(), Some("bash"));
+        assert_eq!(rules[1].event, HookEvent::Compaction);
         assert_eq!(diagnostics.len(), 1);
     }
 
@@ -819,6 +892,28 @@ command = "echo nope"
         runner.handle_event(&ev, CancellationToken::new()).await;
         let body = tokio::fs::read_to_string(out).await.unwrap();
         assert_eq!(body, "tool_end bash ");
+    }
+
+    #[tokio::test]
+    async fn compaction_command_hook_receives_env_and_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hook.out");
+        let mut r = rule(HookEvent::Compaction);
+        r.command = Some(format!(
+            "printf '%s %s %s ' \"$PIE_HOOK_EVENT\" \"$PIE_COMPACTION_TRIGGER\" \"$PIE_COMPACTION_TOKENS_BEFORE\" > {}; grep -q '\"compaction_summary\":\"summary text\"' \"$PIE_HOOK_PAYLOAD\"",
+            out.display()
+        ));
+        let runner = runner(vec![r]);
+        let ev = HarnessEvent::Compaction {
+            from_hook: true,
+            summary: "summary text".into(),
+            tokens_before: 42,
+        };
+        runner
+            .handle_harness_event(&ev, CancellationToken::new())
+            .await;
+        let body = tokio::fs::read_to_string(out).await.unwrap();
+        assert_eq!(body, "compaction manual 42 ");
     }
 
     #[tokio::test]

@@ -37,8 +37,9 @@ pub enum HarnessEvent {
     /// fires this once. `messages_replayed` reflects how many session messages were already on
     /// the active branch (e.g. a `--resume` start vs a fresh session).
     SessionStart { messages_replayed: usize },
-    /// Auto- or manual compaction ran. `from_hook = true` means it was triggered by the
-    /// internal threshold check before a prompt; `false` means `force_compact` was called.
+    /// Auto- or manual compaction ran. `from_hook = true` currently means it came from
+    /// `force_compact` (the CLI `/compact` path); `false` means the internal threshold check
+    /// triggered it before a prompt.
     Compaction {
         from_hook: bool,
         summary: String,
