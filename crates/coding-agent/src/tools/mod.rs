@@ -14,6 +14,7 @@ pub mod read;
 pub mod task;
 pub mod truncate;
 pub mod web_fetch;
+pub mod web_search;
 pub mod write;
 
 use std::sync::Arc;
@@ -32,6 +33,7 @@ pub fn default_tools(memory_dir: std::path::PathBuf) -> Vec<Arc<dyn AgentTool>> 
         Arc::new(grep::GrepTool),
         Arc::new(find::FindTool),
         Arc::new(web_fetch::WebFetchTool),
+        Arc::new(web_search::WebSearchTool::new()),
         Arc::new(git::GitTool),
         Arc::new(memory::MemoryTool::new(memory_dir)),
     ]
