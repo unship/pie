@@ -12,9 +12,17 @@ use pie_agent_core::{
 };
 
 // The binary crate doesn't expose `commands` — pull it in via path-include so this test
-// exercises the actual code path without restructuring the crate as a [lib].
+// exercises the actual code path without restructuring the crate as a [lib]. `commands.rs`
+// references `crate::export`, so we include those siblings too. They appear unused-from-tests
+// (no items are called directly here) — that's fine; the commands module reaches into them.
 #[path = "../src/commands.rs"]
 mod commands;
+#[allow(dead_code)]
+#[path = "../src/config.rs"]
+mod config;
+#[allow(dead_code)]
+#[path = "../src/export.rs"]
+mod export;
 
 fn faux_model() -> pie_ai::Model {
     pie_ai::Model {
@@ -43,11 +51,13 @@ async fn dispatch_thinking_command_updates_state_and_session() {
     let harness = Arc::new(AgentHarness::new(opts));
 
     let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
     let ctx = commands::CommandCtx {
         harness: &harness,
         session_id: "test",
         log_path: None,
         tool_count: 0,
+        cwd: &cwd,
     };
 
     let outcome = commands::dispatch("/thinking high", &registry, &ctx).await;
@@ -78,11 +88,13 @@ async fn dispatch_unknown_command_returns_error_outcome() {
     let harness = Arc::new(AgentHarness::new(opts));
 
     let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
     let ctx = commands::CommandCtx {
         harness: &harness,
         session_id: "test",
         log_path: None,
         tool_count: 0,
+        cwd: &cwd,
     };
     let outcome = commands::dispatch("/notarealcommand", &registry, &ctx).await;
     match outcome {
@@ -99,11 +111,13 @@ async fn dispatch_quit_returns_quit_outcome() {
     let harness = Arc::new(AgentHarness::new(opts));
 
     let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
     let ctx = commands::CommandCtx {
         harness: &harness,
         session_id: "test",
         log_path: None,
         tool_count: 0,
+        cwd: &cwd,
     };
 
     for input in ["/quit", "/exit", "/q"] {

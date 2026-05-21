@@ -31,6 +31,7 @@ pub struct CommandCtx<'a> {
     pub session_id: &'a str,
     pub log_path: Option<&'a PathBuf>,
     pub tool_count: usize,
+    pub cwd: &'a std::path::Path,
 }
 
 #[async_trait]
@@ -72,6 +73,7 @@ impl Registry {
         r.register(Arc::new(CostCommand));
         r.register(Arc::new(DiagCommand));
         r.register(Arc::new(TemplateCommand));
+        r.register(Arc::new(SaveCommand));
         r
     }
 
@@ -434,6 +436,42 @@ impl SlashCommand for TemplateCommand {
         match ctx.harness.prompt_from_template(&name, vars).await {
             Ok(()) => CommandOutcome::Handled,
             Err(e) => CommandOutcome::Error(format!("template run failed: {e}")),
+        }
+    }
+}
+
+struct SaveCommand;
+
+#[async_trait]
+impl SlashCommand for SaveCommand {
+    fn name(&self) -> &'static str {
+        "save"
+    }
+    fn description(&self) -> &'static str {
+        "export session transcript to Markdown"
+    }
+    fn usage(&self) -> &'static str {
+        "[path]"
+    }
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        let dest = if let Some(path) = argv.first() {
+            std::path::PathBuf::from(path)
+        } else {
+            crate::export::default_export_path(ctx.session_id)
+        };
+        // If the path is relative, resolve against cwd so /save foo.md lands where the user
+        // expects (and not in some random working dir).
+        let dest = if dest.is_absolute() {
+            dest
+        } else {
+            ctx.cwd.join(dest)
+        };
+        match crate::export::save(ctx.harness.session(), &dest).await {
+            Ok(p) => {
+                println!("saved transcript: {}", p.display());
+                CommandOutcome::Handled
+            }
+            Err(e) => CommandOutcome::Error(format!("save failed: {e}")),
         }
     }
 }

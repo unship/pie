@@ -8,6 +8,7 @@
 mod agent_session;
 mod commands;
 mod config;
+mod export;
 mod logging;
 mod mentions;
 mod model;
@@ -266,6 +267,7 @@ async fn run_repl(cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> 
                 session_id: &session_id,
                 log_path: logging.as_ref().map(|l| &l.log_path),
                 tool_count: tool_names.len(),
+                cwd: &cwd,
             };
             match commands::dispatch(input, &registry, &ctx).await {
                 commands::CommandOutcome::Quit => {
