@@ -5,6 +5,7 @@
 pub mod bash;
 pub mod edit;
 pub mod find;
+pub mod git;
 pub mod grep;
 pub mod ls;
 pub mod memory;
@@ -29,6 +30,7 @@ pub fn default_tools(memory_dir: std::path::PathBuf) -> Vec<Arc<dyn AgentTool>> 
         Arc::new(grep::GrepTool),
         Arc::new(find::FindTool),
         Arc::new(web_fetch::WebFetchTool),
+        Arc::new(git::GitTool),
         Arc::new(memory::MemoryTool::new(memory_dir)),
     ]
 }
