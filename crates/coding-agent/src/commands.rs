@@ -74,6 +74,8 @@ impl Registry {
         r.register(Arc::new(DiagCommand));
         r.register(Arc::new(TemplateCommand));
         r.register(Arc::new(SaveCommand));
+        r.register(Arc::new(CompactCommand));
+        r.register(Arc::new(UndoCommand));
         r
     }
 
@@ -472,6 +474,84 @@ impl SlashCommand for SaveCommand {
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("save failed: {e}")),
+        }
+    }
+}
+
+struct CompactCommand;
+
+#[async_trait]
+impl SlashCommand for CompactCommand {
+    fn name(&self) -> &'static str {
+        "compact"
+    }
+    fn description(&self) -> &'static str {
+        "force a context compaction now (no-op when nothing to summarize)"
+    }
+    fn usage(&self) -> &'static str {
+        "[\"custom instructions\"]"
+    }
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        let custom = if argv.is_empty() {
+            None
+        } else {
+            Some(argv.join(" "))
+        };
+        match ctx.harness.force_compact(custom).await {
+            Ok(true) => {
+                println!("compaction ran");
+                CommandOutcome::Handled
+            }
+            Ok(false) => {
+                println!("nothing to compact");
+                CommandOutcome::Handled
+            }
+            Err(e) => CommandOutcome::Error(format!("compaction failed: {e}")),
+        }
+    }
+}
+
+struct UndoCommand;
+
+#[async_trait]
+impl SlashCommand for UndoCommand {
+    fn name(&self) -> &'static str {
+        "undo"
+    }
+    fn description(&self) -> &'static str {
+        "remove the most recent user+assistant turn from the active branch"
+    }
+    async fn run(&self, _argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        let session = ctx.harness.session();
+        let path = match session.branch(None).await {
+            Ok(p) => p,
+            Err(e) => return CommandOutcome::Error(format!("read branch: {e}")),
+        };
+        // Walk backwards for the most recent Message that's a User. That message is the
+        // start of the turn we want to drop.
+        let mut target_parent: Option<String> = None;
+        let mut found = false;
+        for entry in path.iter().rev() {
+            if let pie_agent_core::SessionTreeEntry::Message {
+                message: pie_agent_core::AgentMessage::Llm(pie_ai::Message::User(_)),
+                parent_id,
+                ..
+            } = entry
+            {
+                target_parent = parent_id.clone();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return CommandOutcome::Error("no user message to undo".into());
+        }
+        match ctx.harness.move_to(target_parent.as_deref(), None).await {
+            Ok(_) => {
+                println!("undid last turn");
+                CommandOutcome::Handled
+            }
+            Err(e) => CommandOutcome::Error(format!("undo failed: {e}")),
         }
     }
 }
