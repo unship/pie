@@ -358,6 +358,98 @@ async fn harness_event_bus_delivers_session_and_branch() {
     );
 }
 
+/// `Agent::abort` cancels the in-flight prompt cleanly: the prompt future resolves with an
+/// `Err` and the session jsonl contains a user message (before the abort) but no further
+/// assistant content for the cancelled turn.
+#[tokio::test]
+async fn abort_cancels_in_flight_prompt() {
+    // A stream_fn that delays before emitting Done. The cancel token flip during this delay
+    // should land us in the agent loop's abort branch.
+    let slow_stream: StreamFn = Arc::new(move |_, _, _| {
+        let (stream, mut sender) = AssistantMessageEventStream::new();
+        tokio::spawn(async move {
+            // Long enough that the test has time to call abort() before Done arrives.
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let msg = AssistantMessage {
+                role: AssistantRole::Assistant,
+                content: vec![ContentBlock::text("should-not-arrive")],
+                api: pie_ai::Api::from("faux"),
+                provider: pie_ai::Provider::from("faux"),
+                model: "faux".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            sender.push(AssistantMessageEvent::Start {
+                partial: msg.clone(),
+            });
+            sender.push(AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                message: msg,
+            });
+        });
+        stream
+    });
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(slow_stream);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let h2 = harness.clone();
+    let prompt_task = tokio::spawn(async move { h2.prompt("hi").await });
+
+    // Give the agent loop a moment to install the cancel token.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    harness.abort();
+
+    let outcome = prompt_task.await.expect("prompt task did not panic");
+    assert!(outcome.is_err(), "aborted prompt should return Err");
+    let err = outcome.unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("abort"),
+        "error should mention abort: {err}"
+    );
+
+    // Session should contain the user message we sent, but the slow assistant message must
+    // NOT have been persisted (Done never reached MessageEnd before abort).
+    let entries = session.entries().await.unwrap();
+    let user_count = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                SessionTreeEntry::Message {
+                    message: AgentMessage::Llm(pie_ai::Message::User(_)),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(user_count, 1, "user message should be persisted");
+    let assistant_count = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                SessionTreeEntry::Message {
+                    message: AgentMessage::Llm(pie_ai::Message::Assistant(_)),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        assistant_count, 0,
+        "no assistant turn should land on the aborted branch"
+    );
+}
+
 /// A panicking listener does not poison the bus — other listeners still receive events.
 #[tokio::test]
 async fn harness_event_bus_isolates_panicking_listener() {

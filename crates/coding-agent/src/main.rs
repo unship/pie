@@ -13,7 +13,10 @@ mod skills;
 mod tools;
 mod tui;
 
-use std::io::{BufRead as _, Write as _};
+use std::io::Write as _;
+use std::time::{Duration, Instant};
+
+use tokio::io::AsyncBufReadExt as _;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -179,15 +182,39 @@ async fn run_repl(cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> 
     // Wire the TUI listener so each prompt's events stream live.
     let _unsub = harness.agent().subscribe(tui.listener());
 
-    // REPL.
-    let stdin = std::io::stdin();
+    // REPL — async stdin so we can race a Ctrl-C abort against the in-flight prompt.
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut last_idle_ctrlc: Option<Instant> = None;
+
     loop {
         tui.user_prompt_marker();
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            tui.system_line("eof — exiting");
-            break;
-        }
+
+        // Idle read with double-Ctrl-C-to-exit semantics. tokio's ctrl_c() yields each time a
+        // SIGINT arrives — so awaiting it once gets the next signal cleanly.
+        let line = tokio::select! {
+            line = stdin.next_line() => match line {
+                Ok(Some(l)) => l,
+                Ok(None) => { tui.system_line("eof — exiting"); break; }
+                Err(e) => { tui.error_line(&format!("{e}")); break; }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                let now = Instant::now();
+                if last_idle_ctrlc
+                    .map(|t| now.duration_since(t) < Duration::from_millis(1500))
+                    .unwrap_or(false)
+                {
+                    tui.system_line("bye");
+                    break;
+                }
+                last_idle_ctrlc = Some(now);
+                tui.system_line("press Ctrl-C again within 1.5s to exit, or type /quit");
+                continue;
+            }
+        };
+
+        // Successful input clears the "second-Ctrl-C-to-exit" arming.
+        last_idle_ctrlc = None;
+
         let input = line.trim();
         if input.is_empty() {
             continue;
@@ -210,7 +237,39 @@ async fn run_repl(cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> 
             print_skills(&harness);
             continue;
         }
-        if let Err(e) = session_runner.prompt(input.to_string()).await {
+
+        // Run the prompt while watching for Ctrl-C. On signal, ask the harness to abort and
+        // keep awaiting the future so it cleans up; the result tells us whether it aborted.
+        let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let aborted_for_signal = aborted.clone();
+        let harness_for_signal = harness.clone();
+        let prompt_fut = session_runner.prompt(input.to_string());
+        tokio::pin!(prompt_fut);
+        let signal_fut = async move {
+            // First Ctrl-C while a prompt is in flight: abort.
+            let _ = tokio::signal::ctrl_c().await;
+            harness_for_signal.abort();
+            aborted_for_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        tokio::pin!(signal_fut);
+
+        // `biased` keeps the prompt future polled first so a fast completion doesn't get
+        // pre-empted by a stale signal future.
+        let res = loop {
+            tokio::select! {
+                biased;
+                res = &mut prompt_fut => break res,
+                _ = &mut signal_fut, if !aborted.load(std::sync::atomic::Ordering::SeqCst) => {
+                    // The signal future will not re-arm after firing; subsequent ctrl_c during
+                    // the same turn falls through to default tokio handling. Loop back to
+                    // continue awaiting the prompt future for clean unwind.
+                }
+            }
+        };
+
+        if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+            tui.system_line("[aborted]");
+        } else if let Err(e) = res {
             tui.error_line(&format!("{e}"));
         }
     }
