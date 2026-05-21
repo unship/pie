@@ -456,15 +456,17 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         // @file expansion) so recall surfaces what the user actually typed.
         history.append(input);
 
-        // Active-prompt spinner. Starts before the prompt future, gets cancelled on the
-        // FIRST agent event via `stop_sync()` — the cancel path also emits the line clear
-        // immediately, so streamed assistant output begins on a clean stderr line.
+        // Active-prompt spinner. Starts BEFORE the prompt future, gets cancelled on the
+        // first event that means "the LLM is now producing output" — content deltas and
+        // tool executions. Not on AgentStart (fires before the LLM is contacted).
         let spin = spinner::start("thinking");
         let spin_for_listener = spin.clone();
-        let _unsub_spin = harness.agent().subscribe(std::sync::Arc::new(move |_, _| {
+        let _unsub_spin = harness.agent().subscribe(std::sync::Arc::new(move |ev, _| {
             let s = spin_for_listener.clone();
             Box::pin(async move {
-                s.stop_sync();
+                if should_stop_spinner_on(&ev) {
+                    s.stop_sync();
+                }
             })
         }));
 
@@ -512,6 +514,28 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         }
     }
     Ok(())
+}
+
+/// Predicate for spinner cancellation. The spinner should remain visible during the gap
+/// between user submission and "the LLM started producing output" — so we stop it on
+/// content deltas (text / thinking) and on tool execution start. AgentStart / MessageStart
+/// fire too early to be useful here.
+fn should_stop_spinner_on(ev: &pie_agent_core::AgentEvent) -> bool {
+    use pie_agent_core::AgentEvent;
+    use pie_ai::AssistantMessageEvent;
+    match ev {
+        AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. } => true,
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => matches!(
+            assistant_message_event,
+            AssistantMessageEvent::TextDelta { .. }
+                | AssistantMessageEvent::ThinkingDelta { .. }
+                | AssistantMessageEvent::ToolCallDelta { .. }
+        ),
+        _ => false,
+    }
 }
 
 fn parse_thinking(s: &str) -> Result<ThinkingLevel> {

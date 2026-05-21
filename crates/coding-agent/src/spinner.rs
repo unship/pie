@@ -1,41 +1,93 @@
-//! Active-prompt spinner. Animates a braille frame to stderr while the agent is thinking
-//! (between the user's submission and the first streamed event), then clears its line and
-//! exits the moment any agent output is emitted.
+//! Active-prompt spinner. Animates a braille frame to stderr while the agent is between
+//! "user submitted" and "LLM is producing content" — then clears its line and exits the
+//! moment the first content delta arrives.
 //!
-//! Previous attempt was racy: the animation task only checked its stop flag on the next
-//! tick (up to 80ms later), by which time the cursor had moved to the assistant's line
-//! and the spinner's `\r\x1b[2K` cleanup wiped the wrong line. Fix is `stop_sync()`: the
-//! listener that flips the flag also emits the clearing escape **immediately**, so by the
-//! time the listener's own output starts the cursor is on a clean stderr line.
+//! Design points discovered the hard way:
+//!
+//! 1. **Render frame 0 synchronously inside `start()`.** `tokio::spawn` only queues the
+//!    task; the executor doesn't run it until the current task yields. The agent loop's
+//!    early `emit()` calls run listeners inline, and the listener's `stop_sync()` would
+//!    beat the spawned task's first draw. We render frame 0 on the caller's thread.
+//!
+//! 2. **`stop_sync()` flips the flag AND clears on the caller's thread.** The animation
+//!    task only checks the flag at frame boundaries (80ms); cleanup there would race
+//!    with renderer stdout writes.
+//!
+//! 3. **Stop on first content delta, not on `AgentStart`.** The caller wires this via
+//!    [`should_stop_spinner_on`] in `main.rs`.
+//!
+//! Tests inject their own `SpinnerSink` so we can observe the exact byte stream the
+//! spinner emits, without touching the process's real stderr.
 
 use std::io::IsTerminal;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const FRAME_MS: u64 = 80;
 
+/// Where the spinner writes. Production wraps stderr; tests wrap a `Vec<u8>` so the byte
+/// stream is observable.
+pub trait SpinnerSink: Send + Sync {
+    fn write(&self, bytes: &[u8]);
+}
+
+struct StderrSink;
+impl SpinnerSink for StderrSink {
+    fn write(&self, bytes: &[u8]) {
+        use std::io::Write;
+        let mut err = std::io::stderr();
+        let _ = err.write_all(bytes);
+        let _ = err.flush();
+    }
+}
+
+/// Test sink that appends every write to an in-memory buffer. Public-but-test-only so
+/// the integration tests under `tests/spinner_e2e.rs` can use it via path-include.
+#[derive(Default, Clone)]
+#[allow(dead_code)]
+pub struct BufferSink {
+    pub buf: Arc<Mutex<Vec<u8>>>,
+}
+
+#[allow(dead_code)]
+impl BufferSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.buf.lock().clone()
+    }
+    pub fn as_string(&self) -> String {
+        String::from_utf8_lossy(&self.snapshot()).into_owned()
+    }
+}
+
+impl SpinnerSink for BufferSink {
+    fn write(&self, bytes: &[u8]) {
+        self.buf.lock().extend_from_slice(bytes);
+    }
+}
+
 #[derive(Clone)]
 pub struct SpinnerHandle {
     stop: Arc<AtomicBool>,
+    sink: Arc<dyn SpinnerSink>,
     enabled: bool,
 }
 
 impl SpinnerHandle {
-    /// Flip the stop flag AND emit the line-clear escape directly. Called on the same
-    /// thread that's about to print agent output — guarantees the cursor sits at column 0
-    /// of a clean stderr line before output starts.
+    /// Idempotent stop. Flips the flag, then synchronously emits the line-clear escape so
+    /// any subsequent write by the caller lands on a clean line.
     pub fn stop_sync(&self) {
         if self.stop.swap(true, Ordering::SeqCst) {
-            // Already stopped — no-op.
             return;
         }
         if self.enabled {
-            use std::io::Write;
-            let mut err = std::io::stderr();
-            let _ = err.write_all(b"\r\x1b[2K");
-            let _ = err.flush();
+            self.sink.write(b"\r\x1b[2K");
         }
     }
 }
@@ -46,34 +98,56 @@ impl Drop for SpinnerHandle {
     }
 }
 
-/// Start the spinner. Returns a clonable handle — clone one copy into a Drop-on-event
-/// listener and keep another in the REPL for a final cleanup.
+fn draw_frame(sink: &Arc<dyn SpinnerSink>, idx: usize, label: &str) {
+    let icon = FRAMES[idx % FRAMES.len()];
+    let line = format!("\r\x1b[2K{icon} {label}");
+    sink.write(line.as_bytes());
+}
+
+/// Production entry point — writes to stderr when stderr is a TTY, no-ops on pipes/CI.
 pub fn start(label: impl Into<String>) -> SpinnerHandle {
     let enabled = std::io::stderr().is_terminal();
+    start_with(label, Arc::new(StderrSink) as Arc<dyn SpinnerSink>, enabled)
+}
+
+/// Test entry point — inject a custom sink + force-enable.
+#[allow(dead_code)]
+pub fn start_with(
+    label: impl Into<String>,
+    sink: Arc<dyn SpinnerSink>,
+    enabled: bool,
+) -> SpinnerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     if !enabled {
-        return SpinnerHandle { stop, enabled };
+        return SpinnerHandle {
+            stop,
+            sink,
+            enabled,
+        };
     }
     let label = label.into();
+    // Render frame 0 right now — no waiting for the executor to pick up the spawned task.
+    draw_frame(&sink, 0, &label);
+
     let stop_clone = stop.clone();
+    let sink_for_task = sink.clone();
+    let frame_counter = Arc::new(AtomicUsize::new(1));
+    let label_for_task = label;
     tokio::spawn(async move {
-        let mut frame = 0usize;
         loop {
-            // The animation task only writes when the flag is false. The `stop_sync` call
-            // path already cleared the line, so we never emit a stale frame after stop.
+            tokio::time::sleep(Duration::from_millis(FRAME_MS)).await;
             if stop_clone.load(Ordering::SeqCst) {
                 break;
             }
-            let icon = FRAMES[frame % FRAMES.len()];
-            use std::io::Write;
-            let mut err = std::io::stderr();
-            let _ = write!(err, "\r\x1b[2K{icon} {label}");
-            let _ = err.flush();
-            frame = frame.wrapping_add(1);
-            tokio::time::sleep(Duration::from_millis(FRAME_MS)).await;
+            let idx = frame_counter.fetch_add(1, Ordering::SeqCst);
+            draw_frame(&sink_for_task, idx, &label_for_task);
         }
     });
-    SpinnerHandle { stop, enabled }
+    SpinnerHandle {
+        stop,
+        sink,
+        enabled,
+    }
 }
 
 #[cfg(test)]
@@ -81,14 +155,70 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn stop_sync_is_idempotent() {
-        let h = start("thinking");
-        h.stop_sync();
-        h.stop_sync(); // must not panic / write twice
+    async fn first_frame_renders_synchronously_in_start() {
+        let sink = BufferSink::new();
+        let _h = start_with("thinking", Arc::new(sink.clone()), true);
+        // No await between start() and snapshot — frame 0 MUST already be there.
+        let body = sink.as_string();
+        assert!(
+            body.contains("⠋"),
+            "frame 0 missing from synchronous render: {body:?}"
+        );
+        assert!(body.contains("thinking"), "label missing: {body:?}");
     }
 
-    #[test]
-    fn frames_present() {
-        assert!(!FRAMES.is_empty());
+    #[tokio::test]
+    async fn spinner_animates_multiple_frames_over_time() {
+        let sink = BufferSink::new();
+        let h = start_with("thinking", Arc::new(sink.clone()), true);
+        // Let the animation task drive 3-4 frames.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.stop_sync();
+        let body = sink.as_string();
+        // At least two distinct frame glyphs should have been emitted.
+        let frame_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let distinct: usize = frame_chars.iter().filter(|f| body.contains(*f)).count();
+        assert!(
+            distinct >= 2,
+            "expected ≥2 distinct frames, got {distinct} in {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_sync_emits_line_clear_immediately() {
+        let sink = BufferSink::new();
+        let h = start_with("thinking", Arc::new(sink.clone()), true);
+        // Snapshot before stop.
+        let before = sink.as_string();
+        h.stop_sync();
+        let after = sink.as_string();
+        let cleared = &after[before.len()..];
+        assert_eq!(
+            cleared, "\r\x1b[2K",
+            "stop_sync must emit clear escape immediately, got {cleared:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_sync_is_idempotent() {
+        let sink = BufferSink::new();
+        let h = start_with("thinking", Arc::new(sink.clone()), true);
+        h.stop_sync();
+        let after_first = sink.as_string().len();
+        h.stop_sync();
+        let after_second = sink.as_string().len();
+        assert_eq!(
+            after_first, after_second,
+            "second stop_sync must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_spinner_writes_nothing() {
+        let sink = BufferSink::new();
+        let h = start_with("thinking", Arc::new(sink.clone()), false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.stop_sync();
+        assert_eq!(sink.snapshot().len(), 0, "disabled spinner must be silent");
     }
 }
