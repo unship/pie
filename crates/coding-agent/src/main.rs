@@ -66,6 +66,9 @@ struct Cli {
     /// List sessions for this cwd and exit.
     #[arg(long)]
     list_sessions: bool,
+    /// List sessions across every cwd we know about (~/.pie/sessions/*) and exit.
+    #[arg(long)]
+    list_all_sessions: bool,
     /// Delete a session by id and exit.
     #[arg(long, value_name = "ID")]
     delete_session: Option<String>,
@@ -83,6 +86,9 @@ async fn main() -> Result<()> {
 
     if cli.list_sessions {
         return list_sessions_cmd(&repo).await;
+    }
+    if cli.list_all_sessions {
+        return list_all_sessions_cmd().await;
     }
     if let Some(id) = &cli.delete_session {
         return delete_session_cmd(&repo, id).await;
@@ -106,6 +112,51 @@ async fn list_sessions_cmd(repo: &JsonlSessionRepo) -> Result<()> {
             e.created_at,
             preview
         );
+    }
+    Ok(())
+}
+
+/// List sessions across every cwd-hash bucket under `<base>/sessions/`. For each session we
+/// show: short id, the cwd it was created from, created-at timestamp, first user-message
+/// preview.
+async fn list_all_sessions_cmd() -> Result<()> {
+    let root = config::base_dir().join("sessions");
+    if !root.exists() {
+        println!("(no sessions root: {})", root.display());
+        return Ok(());
+    }
+    let mut buckets = Vec::new();
+    let mut rd = tokio::fs::read_dir(&root)
+        .await
+        .with_context(|| format!("read {}", root.display()))?;
+    while let Some(entry) = rd.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            buckets.push(entry.path());
+        }
+    }
+    buckets.sort();
+
+    let mut all = Vec::new();
+    for b in &buckets {
+        let repo = pie_agent_core::JsonlSessionRepo::new(b);
+        // list_entries may return Err if the bucket is empty/malformed; skip those gracefully.
+        let entries = session::list_entries(&repo).await.unwrap_or_default();
+        for e in entries {
+            all.push((b.clone(), e));
+        }
+    }
+    if all.is_empty() {
+        println!("(no sessions found under {})", root.display());
+        return Ok(());
+    }
+    // Sort by session id (UUIDv7, time-ordered) so newest is last in output.
+    all.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+    println!("All sessions ({}):", all.len());
+    for (bucket, e) in all {
+        let bucket_name = bucket.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let preview = e.preview.as_deref().unwrap_or("");
+        let id_short: String = e.id.chars().take(16).collect();
+        println!("  {bucket_name}/{id_short}  {}  {preview}", e.created_at);
     }
     Ok(())
 }
