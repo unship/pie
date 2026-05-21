@@ -2,13 +2,14 @@
 //!
 //! Modeled on `packages/coding-agent/` (the TS implementation) in spirit: same tools
 //! (`read`/`write`/`edit`/`bash`/`ls`/`grep`/`find` + `memory`), same `--resume` semantics
-//! scoped by cwd hash, same "interactive TUI" mode. Trimmed scope: no extensions, no skills
-//! loader, no themes, no print/rpc/json modes.
+//! scoped by cwd hash, same "interactive TUI" mode, dual-root skills loader (project ↻ user).
+//! Trimmed scope: no extensions, no themes, no print/rpc/json modes.
 
 mod agent_session;
 mod config;
 mod model;
 mod session;
+mod skills;
 mod tools;
 mod tui;
 
@@ -126,10 +127,13 @@ async fn run_repl(cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> 
     let memory_block = tools::memory::load_memory_block(&memory_dir).await;
     let system_prompt = compose_system_prompt(&cwd, &memory_block, &tool_names);
 
+    let loaded_skills = skills::load_all(&cwd).await;
+
     let mut opts = AgentHarnessOptions::new(model.clone(), session.clone());
     opts.system_prompt = system_prompt;
     opts.thinking_level = thinking;
     opts.tools = tools;
+    opts.skills = loaded_skills.skills.clone();
     let harness = std::sync::Arc::new(AgentHarness::new(opts));
     let session_runner =
         agent_session::AgentSession::new(harness.clone(), agent_session::RetrySettings::default());
@@ -149,6 +153,25 @@ async fn run_repl(cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> 
         .clone()
         .unwrap_or_else(|| model.clone());
     tui.banner(&display_model, &session_id, resumed, &tool_names);
+    if !loaded_skills.skills.is_empty() {
+        tui.system_line(&format!(
+            "loaded {} skill(s): {}",
+            loaded_skills.skills.len(),
+            loaded_skills
+                .skills
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !loaded_skills.diagnostics.is_empty() {
+        tui.system_line(&format!(
+            "skills loader: {} diagnostic(s), first: {}",
+            loaded_skills.diagnostics.len(),
+            loaded_skills.diagnostics[0].message
+        ));
+    }
     if let Some(ctx) = replay_context.as_ref() {
         replay_transcript(ctx, &tui);
     }
@@ -183,6 +206,10 @@ async fn run_repl(cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> 
             let _ = std::io::stdout().flush();
             continue;
         }
+        if input == "/skills" {
+            print_skills(&harness);
+            continue;
+        }
         if let Err(e) = session_runner.prompt(input.to_string()).await {
             tui.error_line(&format!("{e}"));
         }
@@ -194,11 +221,29 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!("  /help          show this help");
+    println!("  /skills        list loaded skills");
     println!("  /clear         clear screen (keeps history)");
     println!("  /quit | /q     exit");
     println!();
     println!("Anything else is sent as a prompt to the agent.");
     println!();
+}
+
+fn print_skills(harness: &AgentHarness) {
+    let skills = harness.skills();
+    if skills.is_empty() {
+        println!(
+            "(no skills loaded — drop SKILL.md files under ~/.pie/skills/<name>/ or <cwd>/.pie/skills/<name>/)"
+        );
+        return;
+    }
+    println!("Loaded skills ({}):", skills.len());
+    for s in &skills {
+        println!("  - {}  ({})", s.name, s.file_path);
+        if !s.description.is_empty() {
+            println!("      {}", s.description);
+        }
+    }
 }
 
 fn parse_thinking(s: &str) -> Result<ThinkingLevel> {
