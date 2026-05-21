@@ -79,6 +79,7 @@ impl Registry {
         r.register(Arc::new(BugReportCommand));
         r.register(Arc::new(NameCommand));
         r.register(Arc::new(SessionsCommand));
+        r.register(Arc::new(ShareCommand));
         r
     }
 
@@ -670,6 +671,65 @@ impl SlashCommand for SessionsCommand {
             let id_short: String = e.id.chars().take(16).collect();
             println!("  {}  {}  {}", id_short, e.created_at, preview);
         }
+        CommandOutcome::Handled
+    }
+}
+
+struct ShareCommand;
+
+#[async_trait]
+impl SlashCommand for ShareCommand {
+    fn name(&self) -> &'static str {
+        "share"
+    }
+    fn description(&self) -> &'static str {
+        "upload transcript as a private Gist via gh (requires `gh` on PATH)"
+    }
+    fn usage(&self) -> &'static str {
+        "[--public]"
+    }
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        let public = argv.iter().any(|a| a == "--public");
+
+        // Render and write to a temp file so gh gist create can ingest it.
+        let dir = std::env::temp_dir().join(format!("pie-share-{}", ctx.session_id));
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            return CommandOutcome::Error(format!("share tmp dir: {e}"));
+        }
+        let file = dir.join("transcript.md");
+        if let Err(e) = crate::export::save(ctx.harness.session(), &file).await {
+            return CommandOutcome::Error(format!("save transcript: {e}"));
+        }
+
+        let mut cmd = tokio::process::Command::new("gh");
+        cmd.arg("gist").arg("create");
+        if !public {
+            // gh default is private (secret) gist already; pass it explicitly for clarity.
+            cmd.arg("--secret");
+        } else {
+            cmd.arg("--public");
+        }
+        cmd.arg("--desc")
+            .arg(format!("pie session {}", ctx.session_id))
+            .arg(file.as_os_str());
+
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(e) => {
+                return CommandOutcome::Error(format!(
+                    "gh gist create failed to spawn: {e}. Is gh on PATH?"
+                ));
+            }
+        };
+        if !output.status.success() {
+            return CommandOutcome::Error(format!(
+                "gh gist create exited {}: {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("shared: {url}");
         CommandOutcome::Handled
     }
 }
