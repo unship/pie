@@ -25,6 +25,7 @@ mod oauth;
 mod otlp;
 mod session;
 mod skills;
+#[allow(dead_code)]
 mod spinner;
 mod templates;
 mod tools;
@@ -423,19 +424,13 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         // First-time image attachment goes through harness.prompt_with_images directly; the
         // session_runner retry/rewind path doesn't need to participate for a one-shot
         // describe-this-image flow.
-        let spin = spinner::start("thinking");
-        // Wire a one-shot listener that flips the spinner's stop flag the moment the agent
-        // emits AgentStart (or anything else that puts output on the screen). Without this,
-        // the spinner's periodic `\r\x1b[2K` line-erase fights with the streamed text and
-        // the assistant's response flashes briefly before being wiped. Closes the bug
-        // reported under "enhance TUI ux".
-        let spin_stop = spin.stop_flag();
-        let _unsub_spin = harness.agent().subscribe(std::sync::Arc::new(move |_, _| {
-            let f = spin_stop.clone();
-            Box::pin(async move {
-                f.store(true, std::sync::atomic::Ordering::SeqCst);
-            })
-        }));
+        //
+        // No spinner in the current line-based REPL — the spinner's `\r\x1b[2K` redraw
+        // racing against streamed stdout output corrupts scrollback (it clears whichever
+        // line the cursor happens to be on, which by streaming time is the assistant's
+        // line, not the spinner's). A real status indicator needs to own the cursor; that
+        // lives in the raw-mode TUI overhaul (issue #2 main deliverable). The
+        // `spinner` module is kept for that future renderer to reuse.
         let prompt_fut = async {
             if has_images {
                 harness.prompt_with_images(expanded, pending_images).await
@@ -466,7 +461,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             }
         };
 
-        spin.stop().await;
         if aborted.load(std::sync::atomic::Ordering::SeqCst) {
             tui.system_line("[aborted]");
         } else if let Err(e) = res {

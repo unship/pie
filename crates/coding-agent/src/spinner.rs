@@ -3,8 +3,10 @@
 //!
 //! Goes to stderr deliberately so it doesn't interleave with stdout streaming text. Only
 //! activates when stderr is a TTY; non-TTY runs (CI, pipes) get a silent no-op spinner.
-
-#![allow(dead_code)]
+//!
+//! Not used by the current line-based REPL: `\r\x1b[2K` races against streamed stdout
+//! output and corrupts scrollback. Kept here for the raw-mode TUI renderer (issue #2 main
+//! deliverable) that will own the cursor and can drive the spinner safely.
 
 use std::io::IsTerminal;
 use std::sync::Arc;
