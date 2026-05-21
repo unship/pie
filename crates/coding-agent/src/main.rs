@@ -19,6 +19,7 @@ mod mcp_loader;
 mod mentions;
 mod model;
 mod oauth;
+mod otlp;
 mod session;
 mod skills;
 mod templates;
