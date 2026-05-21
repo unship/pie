@@ -26,6 +26,9 @@ mod config;
 #[allow(dead_code)]
 #[path = "../src/export.rs"]
 mod export;
+#[allow(dead_code)]
+#[path = "../src/session/mod.rs"]
+mod session;
 
 fn faux_model() -> pie_ai::Model {
     pie_ai::Model {

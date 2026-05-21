@@ -78,6 +78,7 @@ impl Registry {
         r.register(Arc::new(UndoCommand));
         r.register(Arc::new(BugReportCommand));
         r.register(Arc::new(NameCommand));
+        r.register(Arc::new(SessionsCommand));
         r
     }
 
@@ -640,6 +641,36 @@ impl SlashCommand for NameCommand {
             }
             Err(e) => CommandOutcome::Error(format!("set name failed: {e}")),
         }
+    }
+}
+
+struct SessionsCommand;
+
+#[async_trait]
+impl SlashCommand for SessionsCommand {
+    fn name(&self) -> &'static str {
+        "sessions"
+    }
+    fn description(&self) -> &'static str {
+        "list sessions for this cwd"
+    }
+    async fn run(&self, _argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        let repo = crate::session::open_repo(ctx.cwd).await;
+        let entries = match crate::session::list_entries(&repo).await {
+            Ok(e) => e,
+            Err(e) => return CommandOutcome::Error(format!("list sessions: {e}")),
+        };
+        if entries.is_empty() {
+            println!("(no sessions for this cwd)");
+            return CommandOutcome::Handled;
+        }
+        println!("Sessions:");
+        for e in entries {
+            let preview = e.preview.as_deref().unwrap_or("");
+            let id_short: String = e.id.chars().take(16).collect();
+            println!("  {}  {}  {}", id_short, e.created_at, preview);
+        }
+        CommandOutcome::Handled
     }
 }
 
