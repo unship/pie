@@ -138,6 +138,14 @@ pub enum HarnessEvent {
     /// material. The parent `trigger_result` audit entry has been written with
     /// `success: false`.
     TriggerFailed { trace_id: String, reason: String },
+    /// An [`TriggerDelivery::InjectAndRun`] trigger has injected its prompt into the **idle**
+    /// parent conversation and is asking the embedder to run ONE model turn in the parent's
+    /// full context. The runtime cannot run the single-tenant parent agent itself from the
+    /// detached trigger task, so it delegates: the embedder (which owns the parent agent and
+    /// its input loop) should funnel this through the same serialized path as user input and
+    /// call [`AgentHarness::continue_`]. Emitted only on the idle path — when the parent is
+    /// mid-turn the runtime enqueues a follow-up instead and this event is NOT emitted.
+    TriggerRequestsMainRun { trace_id: String },
     /// A trigger's `PromoteAction` rendered successfully and the runtime committed to
     /// surfacing the sub-agent result to the user / LLM. pie_ai has no System role today;
     /// the inserted entry is a `Message::User` with a `[Trigger ...]` body prefix so the
@@ -298,9 +306,73 @@ pub struct RunningTriggerState {
 #[derive(Clone, Debug)]
 pub struct TriggerAction {
     pub prompt: String,
+    /// How a successful run is mirrored back into the parent transcript. Honored for
+    /// [`TriggerDelivery::SubAgent`] (applied to the sub-agent's result) and
+    /// [`TriggerDelivery::InjectSummary`] (applied to `trigger.payload_summary` as the
+    /// faux result). **Ignored for [`TriggerDelivery::InjectAndRun`]**: that mode
+    /// direct-injects `prompt` and asks the embedder to run one parent-loop turn, so
+    /// there's no separate "result" for `promote` to act on. Set `promote = None` for
+    /// `InjectAndRun` to make intent obvious.
     pub promote: PromoteAction,
     pub promote_requires_approval: bool,
+    /// How the runtime delivers this action. Default [`TriggerDelivery::SubAgent`] preserves
+    /// the historical behavior (run a sub-agent against `prompt`). [`TriggerDelivery::InjectSummary`]
+    /// skips the sub-agent entirely — see that variant for the rationale.
+    pub delivery: TriggerDelivery,
 }
+
+/// Whether an accepted trigger runs a sub-agent or is delivered straight to the parent loop.
+///
+/// The runtime stays domain-agnostic across both modes: it never inspects what the source
+/// *is*, only moves the opaque `payload_summary` string. Which mode applies is decided
+/// entirely upstream by the [`BeforeTriggerActionHook`] (e.g. a per-source config in
+/// `crates/coding-agent`), never hardcoded here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TriggerDelivery {
+    /// Run a fresh sub-agent against [`TriggerAction::prompt`], then apply `promote` to its
+    /// result. This is the default and the only mode that involves the model.
+    #[default]
+    SubAgent,
+    /// Skip the sub-agent. The runtime treats `trigger.payload_summary` as the result
+    /// `summary` and applies `promote` directly — no model call, no tools, zero cost
+    /// **for the trigger itself**. Used by sources configured as pure notification feeds.
+    /// `prompt` is ignored in this mode.
+    ///
+    /// Note on cost attribution: when `promote` is non-`None` and the parent is mid-turn,
+    /// `apply_promotion`'s streaming branch enqueues a follow-up which the parent loop
+    /// drains into a real model turn. That turn's cost is attributed to the parent agent's
+    /// own usage, not to this trigger's `trigger_result.cost_usd` (which stays 0.0 — an
+    /// honest measurement of the direct trigger work). If you want truly zero cascade cost,
+    /// pair `InjectSummary` with `PromoteAction::None`.
+    InjectSummary,
+    /// Skip the sub-agent, but inject [`TriggerAction::prompt`] into the **parent**
+    /// conversation and arrange for ONE model turn to run in the parent's full context.
+    ///
+    /// The runtime never runs the single-tenant parent agent from the detached trigger task.
+    /// Instead: if the parent is mid-turn it enqueues a follow-up (the running loop picks it
+    /// up at the next boundary); if the parent is idle it appends the message and emits
+    /// [`HarnessEvent::TriggerRequestsMainRun`] so the embedder — which owns the parent agent
+    /// — can schedule the turn on its own serialized loop. The model turn itself is a normal
+    /// parent-loop event, not attributed to this trigger's `trigger_result`.
+    InjectAndRun,
+}
+
+/// Audit-shape note for downstream JSONL readers and `/triggers audit` consumers:
+///
+/// The `trigger_promotion` and `trigger_result` audit entries both carry a
+/// `prefix_injected: bool` field (recording whether the engine had to prepend the
+/// `[Trigger {trace_id}] ` attribution prefix), but the *placement* depends on which
+/// delivery path produced the audit:
+///
+/// - [`TriggerDelivery::SubAgent`] + `PromoteAction::PromoteSummaryNow`/etc.: prefix lives
+///   on the `trigger_promotion` audit (written by `apply_promotion`).
+/// - [`TriggerDelivery::InjectSummary`]: prefix lives on the `trigger_promotion` audit
+///   (`apply_promotion` is still called for the summary).
+/// - [`TriggerDelivery::InjectAndRun`]: prefix lives on the `trigger_result` audit directly
+///   (no `apply_promotion` call; the inject path writes its own audit).
+///
+/// JSONL readers that join on `trace_id` should check both audit types for the field.
+const _AUDIT_SHAPE_DOC: () = ();
 
 impl TriggerAction {
     /// The default `Prompt` form used when no [`BeforeTriggerActionHook`] is configured.
@@ -311,6 +383,7 @@ impl TriggerAction {
             prompt: format!("{} fired: {}", trigger.source_label, trigger.event_label),
             promote: PromoteAction::None,
             promote_requires_approval: false,
+            delivery: TriggerDelivery::SubAgent,
         }
     }
 }
@@ -1465,6 +1538,182 @@ async fn run_trigger_action(
         }
         None => TriggerAction::default_for(&trigger),
     };
+
+    // 1b. Direct-inject delivery. Skip the sub-agent entirely and promote
+    // `trigger.payload_summary` straight into the parent loop via `apply_promotion`. No
+    // model call, no tools, cost is a real 0.0. The kernel stays domain-agnostic — it only
+    // moves the opaque summary string and never learns what the source is. We still emit the
+    // ExecutionStarted/Completed pair and a `trigger_result` audit (with `message_count: 0`
+    // distinguishing it from a sub-agent run) so `/triggers` and jsonl readers see a normal
+    // terminal lifecycle.
+    if action.delivery == TriggerDelivery::InjectSummary {
+        let summary = trigger.payload_summary.clone();
+        emit_from_listeners(
+            &listeners,
+            HarnessEvent::TriggerExecutionStarted {
+                trace_id: trace_id.clone(),
+                source_label: source_label.clone(),
+                event_label: event_label.clone(),
+                prompt_preview: preview_for_banner(
+                    summary.as_deref().unwrap_or("(no summary)"),
+                    80,
+                ),
+            },
+        );
+        let result_data = serde_json::json!({
+            "trace_id": trace_id,
+            "branch_id": serde_json::Value::Null,
+            "success": true,
+            "summary": summary,
+            "message_count": 0,
+            // Honest measurement: an inject performs no model call, unlike the sub-agent
+            // path which reports `null` because its bare `Agent` has no CostTracker.
+            "cost_usd": 0.0,
+            "reason": serde_json::Value::Null,
+            "details": serde_json::Value::Null,
+            "delivery": "inject_summary",
+        });
+        if let Err(e) = parent_session
+            .append_custom("trigger_result", Some(result_data))
+            .await
+        {
+            emit_from_listeners(
+                &listeners,
+                HarnessEvent::PersistenceError {
+                    context: "trigger_result".into(),
+                    message: format!("trigger_result (inject) append failed: {:?}", e.code),
+                },
+            );
+        }
+        emit_from_listeners(
+            &listeners,
+            HarnessEvent::TriggerCompleted {
+                trace_id: trace_id.clone(),
+                summary: summary.clone(),
+                cost_usd: Some(0.0),
+                details: serde_json::Value::Null,
+            },
+        );
+        // Reuse the full promotion machinery: prefix enforcement, streaming/idle injection,
+        // dedup, and the `trigger_promotion` audit. `summary` carries the payload summary, so
+        // a `{{trigger.payload_summary}}` (or `{{result.summary}}`) template renders it.
+        apply_promotion(
+            &listeners,
+            &parent_session,
+            &parent_agent,
+            &trace_id,
+            &trigger,
+            true,
+            &summary,
+            0,
+            None,
+            &action.promote,
+            action.promote_requires_approval,
+            &serde_json::Value::Null,
+        )
+        .await;
+        return;
+    }
+
+    // 1c. Inject-and-run delivery. Inject `action.prompt` (a user-rule instruction carrying
+    // whatever source context the rule chose) into the PARENT conversation, then arrange for
+    // ONE model turn in the parent's full context. The kernel never runs the single-tenant
+    // parent agent from this detached task:
+    //   * streaming → enqueue a follow-up; the in-flight loop runs it at the next boundary.
+    //   * idle      → append the message + emit `TriggerRequestsMainRun`; the embedder (which
+    //                 owns the parent agent) schedules the turn on its own serialized loop.
+    // The model turn itself is a normal parent-loop event, NOT attributed to this
+    // `trigger_result` (whose `message_count` stays 0 — this action only injects + requests).
+    if action.delivery == TriggerDelivery::InjectAndRun {
+        let (body, _truncated) =
+            truncate_on_char_boundary(action.prompt.clone(), PROMOTION_BODY_CAP_BYTES);
+        // Same engine-enforced `[Trigger <id>] ` prefix as promotion, so an injected
+        // instruction is never indistinguishable from human input.
+        let (body, prefix_injected) = ensure_trigger_prefix(body, &trace_id);
+        emit_from_listeners(
+            &listeners,
+            HarnessEvent::TriggerExecutionStarted {
+                trace_id: trace_id.clone(),
+                source_label: source_label.clone(),
+                event_label: event_label.clone(),
+                prompt_preview: preview_for_banner(&body, 80),
+            },
+        );
+
+        let user_message = AgentMessage::Llm(PiMessage::User(pie_ai::UserMessage {
+            role: pie_ai::UserRole::User,
+            content: pie_ai::UserContent::Text(body.clone()),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }));
+
+        // Inject. Mirror `apply_promotion`'s two-branch persistence so the message lands in
+        // the jsonl exactly once and in the right order relative to any in-flight turn.
+        let queued_for_followup = parent_agent.is_streaming();
+        if queued_for_followup {
+            parent_agent.enqueue_follow_up(user_message);
+        } else if let Err(e) = parent_session.append_message(user_message.clone()).await {
+            emit_from_listeners(
+                &listeners,
+                HarnessEvent::PersistenceError {
+                    context: "trigger_inject_and_run".into(),
+                    message: format!("inject_and_run append failed: {:?}", e.code),
+                },
+            );
+        } else {
+            parent_agent.state().messages.push(user_message);
+        }
+
+        let result_data = serde_json::json!({
+            "trace_id": trace_id,
+            "branch_id": serde_json::Value::Null,
+            "success": true,
+            "summary": body,
+            "message_count": 0,
+            "cost_usd": 0.0,
+            "reason": serde_json::Value::Null,
+            "details": serde_json::Value::Null,
+            "delivery": "inject_and_run",
+            "prefix_injected": prefix_injected,
+            "run_dispatch": if queued_for_followup { "follow_up" } else { "main_run_request" },
+        });
+        if let Err(e) = parent_session
+            .append_custom("trigger_result", Some(result_data))
+            .await
+        {
+            emit_from_listeners(
+                &listeners,
+                HarnessEvent::PersistenceError {
+                    context: "trigger_result".into(),
+                    message: format!(
+                        "trigger_result (inject_and_run) append failed: {:?}",
+                        e.code
+                    ),
+                },
+            );
+        }
+
+        emit_from_listeners(
+            &listeners,
+            HarnessEvent::TriggerCompleted {
+                trace_id: trace_id.clone(),
+                summary: Some(body),
+                cost_usd: Some(0.0),
+                details: serde_json::Value::Null,
+            },
+        );
+
+        // Idle parent: no in-flight loop to drain the follow-up, so ask the embedder to run
+        // one turn. Streaming parent already has the follow-up queued.
+        if !queued_for_followup {
+            emit_from_listeners(
+                &listeners,
+                HarnessEvent::TriggerRequestsMainRun {
+                    trace_id: trace_id.clone(),
+                },
+            );
+        }
+        return;
+    }
 
     // 2. Register as in-flight + emit ExecutionStarted. The preview is bounded to ~80 chars
     // because TUI banners cannot render arbitrary user content safely; the full prompt
