@@ -97,6 +97,34 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Added — Framework
 
+- **`InstallSkill` builtin tool (issue #87 sub-PR B)** New harness tool that installs a skill
+  into the user-global skills directory (`~/.pie/skills/<name>/SKILL.md`) from one of three
+  sources: an `https://` URL, an absolute local path, or inline content. After the atomic
+  write, the tool calls `AgentHarness::reload_skills_from_disk` (sub-PR A) so the catalog
+  refreshes without a `pie` restart. Two-phase safety model: the first tool call returns a
+  preview JSON (`name`/`description`/`target_path`/`content_hash`/`size`/`existing`/
+  `overwrite_required`) with no filesystem side effects; the agent must explicitly call again
+  with `confirm: true` (and `overwrite: true` if a same-name skill with different on-disk
+  hash exists) for the install to actually run. The skill body is never echoed verbatim into
+  the tool result. Hard caps: 64 KiB body size, `https://`-only URLs (loopback / RFC1918 /
+  `.localhost` hostnames are pre-flight rejected as an SSRF guard), name must validate as
+  lowercase-kebab. Sequential execution mode so concurrent installs in the same turn don't
+  race. Persistent audit: every successful install appends a
+  `SessionTreeEntry::Custom { custom_type: "skill_install" }` record (status / name /
+  target_path / source_kind / source / before_hash / after_hash / size / overwrote /
+  idempotent / installed_visible_in_catalog / diagnostics_count / warnings — body is never
+  included; inline-content source records `null` to avoid echoing the body); `--resume`,
+  bug-report, and post-hoc forensics now see every model-driven install. The audit write is
+  best-effort — if `append_custom` fails after the file is on disk and the catalog has been
+  reloaded, the install is still considered successful (the alternative of rolling back a
+  successful install on audit-write failure is worse UX). The tool result reports the missed
+  audit via `details.audit_entry_id = null` and a `tracing::warn`. The
+  `PermissionCategory::ControlPlaneWrite` Prompt path is a separate cross-cutting follow-up;
+  for now the two-phase schema is the primary defense, and PR-C (`/skills install <url>`)
+  adds the CLI-side user confirmation. 10 unit tests cover preview-no-side-effects, name
+  traversal rejection, `http://` rejection, SSRF guard, oversized content cap, malformed
+  frontmatter, overwrite required / idempotent re-install, full atomic-install-and-reload
+  path, `skill_install` Custom audit shape + body-no-leak, and tempfile cleanup.
 - **Skill catalog hot-reload (issue #87 sub-PR A)** New `AgentHarnessOptions::reload_skills_fn:
   Option<ReloadSkillsFn>` closure slot + `AgentHarness::reload_skills_from_disk() ->
   Result<LoadSkillsOutput, ReloadSkillsError>` async API. Lets the install path (forthcoming
